@@ -112,7 +112,8 @@ def build_group():
     thr_sock  = add_input(g, "NodeSocketFloat", "Threshold", default=0.0,
                           min_value=-2.0, max_value=2.0)
     thr_sock.description = "Volume-to-Mesh isosurface offset. 0 = default. Positive shrinks, negative grows."
-    add_input(g, "NodeSocketBool",     "Apply Boolean",  default=True)
+    clip_sock = add_input(g, "NodeSocketBool", "Clip to Mesh", default=True)
+    clip_sock.description = "Mask the lattice density to the inside of the input mesh (SDF-based, no boolean)."
     add_output(g, "NodeSocketGeometry", "Geometry")
 
     inp  = new_node(g, "NodeGroupInput",  "In",  (-1800,    0))
@@ -248,8 +249,62 @@ def build_group():
     link(g, get_socket(sw_mode_a, "Output", "outputs"), get_socket(sw_mode_b, "False"))
     link(g, d_solid_b.outputs[0],                       get_socket(sw_mode_b, "True"))
 
-    # Feed selected density into Volume Cube
-    link(g, get_socket(sw_mode_b, "Output", "outputs"), vol.inputs["Density"])
+    # ── SDF mask: combine lattice density with "inside-mesh" indicator ─────
+    # Per voxel:
+    #   1. Geometry Proximity → nearest point Q on the input mesh surface
+    #   2. Sample Nearest Surface → mesh normal N at Q
+    #   3. signed_dist = (P − Q) · N    (negative when P is inside mesh)
+    #   4. inside_density = − signed_dist  (positive inside, like a thin SDF)
+    #   5. combined_density = MIN(lattice_density, inside_density)
+    # The MIN is the SDF intersection: solid only where BOTH the lattice
+    # band is solid AND we're inside the mesh. Volume to Mesh then extracts
+    # both surfaces in a single pass — no separate boolean required.
+    prox = new_node(g, "GeometryNodeProximity", "Mesh Proximity", (-700, -1100))
+    prox.target_element = "FACES"
+    link(g, inp.outputs["Geometry"], prox.inputs["Target"])
+    # Source Position implicit = field's Position (= voxel position).
+
+    input_normal = new_node(g, "GeometryNodeInputNormal", "Mesh Normal Field",
+                            (-1100, -1100))
+
+    sns = new_node(g, "GeometryNodeSampleNearestSurface", "Sample Normal at Q",
+                   (-700, -1300))
+    sns.data_type = "FLOAT_VECTOR"
+    link(g, inp.outputs["Geometry"], sns.inputs["Mesh"])
+    link(g, input_normal.outputs["Normal"], sns.inputs["Value"])
+    # Sample Position implicit = field's Position (voxel position).
+
+    # direction = P − Q
+    direction = new_node(g, "ShaderNodeVectorMath", "P − Q", (-450, -1150))
+    direction.operation = "SUBTRACT"
+    link(g, pos.outputs["Position"],     direction.inputs[0])
+    link(g, prox.outputs["Position"],    direction.inputs[1])
+
+    # signed_dist = direction · normal
+    signed_dot = new_node(g, "ShaderNodeVectorMath", "Dot(dir, normal)",
+                          (-200, -1200))
+    signed_dot.operation = "DOT_PRODUCT"
+    link(g, direction.outputs["Vector"], signed_dot.inputs[0])
+    link(g, sns.outputs["Value"],        signed_dot.inputs[1])
+
+    # inside_density = − signed_dist   (positive inside mesh, neg outside)
+    inside_density = math(g, "MULTIPLY", "Inside Density", (50, -1200), value=-1.0)
+    link(g, signed_dot.outputs["Value"], inside_density.inputs[0])
+
+    # combined = MIN(lattice_density, inside_density)
+    combined = math(g, "MINIMUM", "MIN(lattice, mesh)", (300, -1050))
+    link(g, get_socket(sw_mode_b, "Output", "outputs"), combined.inputs[0])
+    link(g, inside_density.outputs[0],                  combined.inputs[1])
+
+    # Switch between {lattice only} and {clipped to mesh} based on Clip to Mesh
+    sw_clip = new_node(g, "GeometryNodeSwitch", "Clip?", (550, -900))
+    sw_clip.input_type = "FLOAT"
+    link(g, inp.outputs["Clip to Mesh"],                    get_socket(sw_clip, "Switch"))
+    link(g, get_socket(sw_mode_b, "Output", "outputs"),     get_socket(sw_clip, "False"))
+    link(g, combined.outputs[0],                            get_socket(sw_clip, "True"))
+
+    # Feed final density into Volume Cube.
+    link(g, get_socket(sw_clip, "Output", "outputs"), vol.inputs["Density"])
 
     # ── 4. Volume to Mesh ──────────────────────────────────────────────────
     # Default mode uses the input volume's own grid — and we already
@@ -262,26 +317,12 @@ def build_group():
     # iso-surface live without re-running the script.
     link(g, inp.outputs["Threshold"], v2m.inputs["Threshold"])
 
-    # ── 5. Optional Boolean intersect with original geometry ───────────────
-    # In INTERSECT mode the Mesh Boolean node uses ONLY the "Mesh 2" multi-input;
-    # "Mesh 1" is exclusive to DIFFERENCE. Both meshes therefore feed Mesh 2.
-    bool_node = new_node(g, "GeometryNodeMeshBoolean", "Intersect", (900, 0))
-    bool_node.operation = "INTERSECT"
-    link(g, inp.outputs["Geometry"], bool_node.inputs["Mesh 2"])
-    link(g, v2m.outputs["Mesh"],     bool_node.inputs["Mesh 2"])
-
-    # Switch between {raw lattice} and {boolean intersect} based on Apply Boolean.
-    # Using named sockets keeps the script stable across Blender 4.x / 5.x.
-    sw = new_node(g, "GeometryNodeSwitch", "Apply?", (1200, 0))
-    sw.input_type = "GEOMETRY"
-    link(g, inp.outputs["Apply Boolean"], get_socket(sw, "Switch"))
-    link(g, v2m.outputs["Mesh"],          get_socket(sw, "False"))
-    link(g, bool_node.outputs["Mesh"],    get_socket(sw, "True"))
-
-    # ── 6. Smooth shading & output ─────────────────────────────────────────
-    smooth = new_node(g, "GeometryNodeSetShadeSmooth", "Shade Smooth", (1400, 0))
-    link(g, get_socket(sw, "Output", "outputs"), smooth.inputs["Geometry"])
-    link(g, smooth.outputs["Geometry"],          outp.inputs["Geometry"])
+    # ── 5. Smooth shading & output ─────────────────────────────────────────
+    # No boolean needed — Volume to Mesh already produced the clipped result
+    # because the density field was MIN-combined with the mesh-inside SDF.
+    smooth = new_node(g, "GeometryNodeSetShadeSmooth", "Shade Smooth", (900, 0))
+    link(g, v2m.outputs["Mesh"],         smooth.inputs["Geometry"])
+    link(g, smooth.outputs["Geometry"],  outp.inputs["Geometry"])
 
     return g
 
